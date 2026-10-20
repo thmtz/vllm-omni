@@ -28,11 +28,13 @@ MING_TTS_PIPELINE = PipelineConfig(
             hf_config_name="llm_config",
             engine_output_type="latent",
             async_chunk_process_next_stage_input_func=(f"{_PROC}.llm2audio_vae_async_chunk"),
+            # max_tokens is a deploy default (default_sampling_params in the
+            # deploy YAML), not a constraint: as a constraint it overrode the
+            # deploy value, so no deploy could raise the decode budget.
             sampling_constraints={
                 "temperature": 0.0,
                 "top_p": 1.0,
                 "top_k": -1,
-                "max_tokens": 512,
                 "detokenize": True,
             },
         ),
