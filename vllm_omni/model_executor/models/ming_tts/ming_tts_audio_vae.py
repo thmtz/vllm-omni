@@ -74,27 +74,33 @@ class MingAudioVAEModel(nn.Module):
         had_stream_state = _has_stream_state(self._stream_state.get(request_id))
         stream_state = self._stream_state.get(request_id, (None, None, None))
         past_key_values = self._past_key_values.get(request_id)
-        waveform_parts: list[torch.Tensor] = []
 
         patch_count = int(latent_chunk.shape[0])
-        for patch_idx in range(patch_count):
-            # [Batch, Time, Dimension] = [1, patch_size, latent_dim]
-            latent_patch = latent_chunk[patch_idx : patch_idx + 1]
-            is_last_patch = finished and patch_idx == patch_count - 1
+        if patch_count == 0:
+            waveform_flat = torch.zeros((0,), dtype=torch.float32, device=latent_chunk.device)
+            return waveform_flat, stream_state, past_key_values, had_past_key_values, had_stream_state
+
+        # The decoder streams (upsampler state, sliding-window KV cache, ISTFT
+        # overlap buffers), so a chunk can go through in one call instead of one
+        # call per patch. The upsampler holds back its whole latest input as
+        # lookahead, though, so the last patch goes in its own call: that keeps
+        # the held-back audio to one patch, as with per-patch decoding.
+        if finished or patch_count == 1:
+            pieces = [latent_chunk]
+        else:
+            pieces = [latent_chunk[:-1], latent_chunk[-1:]]
+        waveform_parts: list[torch.Tensor] = []
+        for piece_idx, piece in enumerate(pieces):
+            # [patches, patch_size, latent_dim] -> [Batch=1, Time, latent_dim]
             waveform, stream_state, past_key_values = self.audio.decode(
-                latent_patch,
+                piece.reshape(1, -1, piece.shape[-1]),
                 past_key_values=past_key_values,
                 use_cache=True,
                 stream_state=stream_state,
-                last_chunk=is_last_patch,
+                last_chunk=finished and piece_idx == len(pieces) - 1,
             )
             waveform_parts.append(waveform.reshape(-1).to(torch.float32))
-
-        waveform_flat = (
-            torch.cat(waveform_parts, dim=0)
-            if waveform_parts
-            else torch.zeros((0,), dtype=torch.float32, device=latent_chunk.device)
-        )
+        waveform_flat = torch.cat(waveform_parts, dim=0)
         return waveform_flat, stream_state, past_key_values, had_past_key_values, had_stream_state
 
     @torch.inference_mode()
