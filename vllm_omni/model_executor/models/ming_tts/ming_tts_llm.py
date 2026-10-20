@@ -185,35 +185,71 @@ class MingLLMModel(nn.Module):
             token_counts, request_infos = [hidden_states.shape[0]], [{KEY_LATENT_HISTORY: latent_history}]
 
         total_tokens = hidden_states.shape[0]
-        latent_patch_tokens = next_embed_tokens = new_history_tokens = None
-        decode_step_tokens = has_patch = stop_reason_code_tokens = None
-        next_token_ids = []
-        pending_updates: dict[str, dict[str, Any]] = {}
+        # Pass 1: one decode row per request (its last token), in batch order.
+        rows: list[dict[str, Any]] = []
         cursor = 0
-        any_decode = False
         for req_idx, token_count in enumerate(token_counts):
             end = min(cursor + token_count, total_tokens)
             if end <= cursor:
                 continue
             req_info = request_infos[req_idx] if req_idx < len(request_infos) else {}
-            req_id = req_info.get(KEY_REQUEST_ID)
             req_history = _coerce_latent_history(
                 req_info.get(KEY_LATENT_HISTORY), device=hidden_states.device, dtype=self.fm_dtype, cfg=self.ming_config
             )
             if req_history is None:
                 cursor = end
                 continue
+            rows.append(
+                {
+                    "info": req_info,
+                    "output_index": end - 1,
+                    "history": req_history,
+                    "sampling": (
+                        _resolve_runtime_float(req_info, KEY_CFG, self.ming_config.cfg),
+                        _resolve_runtime_float(req_info, KEY_SIGMA, self.ming_config.sigma),
+                        _resolve_runtime_float(req_info, KEY_TEMPERATURE, self.ming_config.temperature),
+                    ),
+                }
+            )
+            cursor = end
+
+        # Pass 2: run the flow head once per group of rows that share sampling
+        # controls, instead of once per request.
+        groups: dict[tuple[float, float, float], list[int]] = {}
+        for row_idx, row in enumerate(rows):
+            groups.setdefault(row["sampling"], []).append(row_idx)
+        for (cfg_scale, sigma, temperature), row_idxs in groups.items():
+            group_index = torch.tensor(
+                [rows[i]["output_index"] for i in row_idxs], device=hidden_states.device, dtype=torch.long
+            )
+            sampled, next_embeds, new_history, stop_probs = self._decode_one_step(
+                hidden_states=hidden_states.index_select(0, group_index),
+                latent_history=torch.cat([rows[i]["history"] for i in row_idxs], dim=0),
+                cfg_scale=cfg_scale,
+                sigma=sigma,
+                temperature=temperature,
+            )
+            stop_prob_values = stop_probs.reshape(-1).tolist()
+            for pos, row_idx in enumerate(row_idxs):
+                rows[row_idx].update(
+                    sampled=sampled[pos : pos + 1],
+                    next_embeds=next_embeds[pos : pos + 1],
+                    new_history=new_history[pos : pos + 1],
+                    stop_probs=stop_probs[pos : pos + 1],
+                    stop_prob=float(stop_prob_values[pos]),
+                )
+
+        # Pass 3: scatter results back to token positions, in batch order.
+        latent_patch_tokens = next_embed_tokens = new_history_tokens = None
+        decode_step_tokens = has_patch = stop_reason_code_tokens = None
+        next_token_ids = []
+        pending_updates: dict[str, dict[str, Any]] = {}
+        for row in rows:
+            req_info = row["info"]
+            req_id = req_info.get(KEY_REQUEST_ID)
+            output_index = row["output_index"]
+            sampled_token_latent, next_embeds, new_history = row["sampled"], row["next_embeds"], row["new_history"]
             decode_step = int(req_info.get(KEY_DECODE_STEP, req_info.get("generated_len", 0)))
-            decode_hidden, output_index = (
-                (hidden_states[cursor:end], cursor) if token_count == 1 else (hidden_states[end - 1 : end], end - 1)
-            )
-            sampled_token_latent, next_embeds, new_history, stop_probs = self._decode_one_step(
-                hidden_states=decode_hidden,
-                latent_history=req_history,
-                cfg_scale=_resolve_runtime_float(req_info, KEY_CFG, self.ming_config.cfg),
-                sigma=_resolve_runtime_float(req_info, KEY_SIGMA, self.ming_config.sigma),
-                temperature=_resolve_runtime_float(req_info, KEY_TEMPERATURE, self.ming_config.temperature),
-            )
             req_max_decode_steps = _resolve_runtime_int(
                 req_info, KEY_MAX_DECODE_STEPS, self.ming_config.max_decode_steps
             )
@@ -236,7 +272,7 @@ class MingLLMModel(nn.Module):
             has_patch[output_index : output_index + 1] = True
             stop_reason, _, _, _, next_token_id = _resolve_ming_stop_decision(
                 step=decode_step,
-                stop_prob=float(stop_probs.reshape(-1)[0].item()),
+                stop_prob=row["stop_prob"],
                 stop_threshold=float(self.ming_config.stop_head_threshold),
                 min_stop_step=int(self.ming_config.stop_head_min_steps),
                 min_decode_steps=req_min_decode_steps,
@@ -251,11 +287,10 @@ class MingLLMModel(nn.Module):
                     KEY_LATENT_HISTORY: new_history,
                     KEY_NEXT_EMBEDS: next_embeds,
                     "ming_latent_patch": sampled_token_latent,
-                    "ming_stop_prob": stop_probs,
+                    "ming_stop_prob": row["stop_probs"],
                     MING_STOP_REASON_KEY: stop_reason,
                 }
-            any_decode = True
-            cursor = end
+        any_decode = bool(rows)
 
         self._pending_postprocess_updates = pending_updates
         if not any_decode:

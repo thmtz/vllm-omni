@@ -50,12 +50,42 @@ def _get_request_token_counts(
             if counts:
                 return counts
 
+    if len(request_infos) > 1:
+        # A mixed batch (one request prefilling while others decode) has more
+        # tokens than requests, so per-request spans must come from the
+        # attention metadata, as in higgs_audio_v2_talker / mimo_audio_llm.
+        spans = _query_start_loc_from_forward_context()
+        if spans is not None and len(spans) == len(request_infos) + 1:
+            return [int(spans[i + 1]) - int(spans[i]) for i in range(len(request_infos))]
+
     if request_infos:
         if len(request_infos) == hidden_states.shape[0]:
             return [1] * hidden_states.shape[0]
+        if len(request_infos) > 1:
+            raise RuntimeError(
+                f"Cannot split {hidden_states.shape[0]} Ming Stage-0 tokens across "
+                f"{len(request_infos)} requests: no seq_token_counts or query_start_loc."
+            )
         return [hidden_states.shape[0]]
 
     return []
+
+
+def _query_start_loc_from_forward_context() -> list[int] | None:
+    if not is_forward_context_available():
+        return None
+    attn_metadata = get_forward_context().attn_metadata
+    if isinstance(attn_metadata, dict):
+        if not attn_metadata:
+            return None
+        attn_metadata = next(iter(attn_metadata.values()))
+    if isinstance(attn_metadata, list):
+        # Per-ubatch metadata lists are not split per request here.
+        return None
+    q_start = getattr(attn_metadata, "query_start_loc", None)
+    if not isinstance(q_start, torch.Tensor):
+        return None
+    return q_start.detach().to("cpu").tolist()
 
 
 def _coerce_latent_history(

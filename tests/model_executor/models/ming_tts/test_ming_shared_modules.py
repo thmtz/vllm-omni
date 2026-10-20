@@ -399,3 +399,107 @@ def test_ming_compute_logits_text_mode_delegates_to_backbone():
 
     assert torch.equal(model.model.hidden_states, hidden_states)
     assert torch.equal(logits, torch.ones((2, 3)))
+
+
+def _make_ming_batch_model(monkeypatch, spans):
+    import vllm_omni.model_executor.models.ming_tts.patch_emission as patch_emission
+
+    class FakeBackbone:
+        def __call__(self, input_ids, positions, intermediate_tensors, inputs_embeds, **kwargs):
+            return inputs_embeds
+
+    monkeypatch.setattr(patch_emission, "_query_start_loc_from_forward_context", lambda: spans)
+    model = object.__new__(MingLLMModel)
+    model.ming_config = SimpleNamespace(
+        llm_vocab_size=8,
+        llm_hidden_size=4,
+        latent_dim=2,
+        patch_size=1,
+        history_patch_size=1,
+        cfg=2.0,
+        sigma=0.25,
+        temperature=0.0,
+        max_decode_steps=100,
+        stop_head_min_steps=0,
+        stop_head_threshold=0.5,
+        audio_dummy_token_id=3,
+        text_eos_token_id=7,
+    )
+    model.fm_dtype = torch.float32
+    model.model = FakeBackbone()
+    model._last_text_mode = False
+    model._last_ming_next_token_ids = None
+    calls = []
+
+    def fake_decode(*, hidden_states, latent_history, cfg_scale, sigma, temperature):
+        # Each row's latent is its conditioning hidden state's first value, so
+        # the test can check rows land at the right token positions.
+        calls.append((hidden_states.shape[0], cfg_scale))
+        batch = hidden_states.shape[0]
+        sampled = hidden_states[:, :1].reshape(batch, 1, 1).expand(batch, 1, 2).clone()
+        next_embeds = hidden_states.reshape(batch, 1, 4).clone()
+        stop_probs = torch.where(hidden_states[:, 0] > 50, 0.9, 0.1)
+        return sampled, next_embeds, sampled.clone(), stop_probs
+
+    model._decode_one_step = fake_decode
+    return model, calls
+
+
+def _ming_request(req_id, value, **extra):
+    return {"ming_request_id": req_id, "ming_latent_history": torch.full((1, 2), float(value)), **extra}
+
+
+def test_ming_forward_mixed_prefill_and_decode_batch(monkeypatch):
+    # Request a decodes (1 token), b prefills (3 tokens), c decodes (1 token).
+    model, calls = _make_ming_batch_model(monkeypatch, spans=[0, 1, 4, 5])
+    hidden = torch.tensor([[10.0] * 4, [0.0] * 4, [0.0] * 4, [20.0] * 4, [60.0] * 4])
+    infos = [_ming_request("a", 1), _ming_request("b", 2), _ming_request("c", 3, ming_decode_step=5)]
+
+    output = MingLLMModel.forward(
+        model,
+        input_ids=torch.zeros(5, dtype=torch.long),
+        positions=torch.arange(5),
+        inputs_embeds=hidden,
+        model_intermediate_buffer=infos,
+    )
+
+    # One flow-head call for all three rows, not one per request.
+    assert calls == [(3, 2.0)]
+    mm = output.multimodal_outputs
+    assert mm["ming_has_patch"].tolist() == [True, False, False, True, True]
+    assert mm["ming_latent_patch"][:, 0, 0].tolist() == [10.0, 0.0, 0.0, 20.0, 60.0]
+    # c is past the minimum steps and its stop prob crosses the threshold, so it alone gets EOS.
+    assert model._last_ming_next_token_ids == [3, 3, 7]
+    assert set(model._pending_postprocess_updates) == {"a", "b", "c"}
+    torch.testing.assert_close(model._pending_postprocess_updates["b"]["ming_next_embeds"], hidden[3].reshape(1, 1, 4))
+
+
+def test_ming_forward_groups_flow_head_by_sampling_controls(monkeypatch):
+    model, calls = _make_ming_batch_model(monkeypatch, spans=None)
+    hidden = torch.tensor([[1.0] * 4, [2.0] * 4, [3.0] * 4])
+    infos = [_ming_request("a", 1), _ming_request("b", 2, ming_cfg=3.0), _ming_request("c", 3)]
+
+    output = MingLLMModel.forward(
+        model,
+        input_ids=torch.zeros(3, dtype=torch.long),
+        positions=torch.arange(3),
+        inputs_embeds=hidden,
+        model_intermediate_buffer=infos,
+    )
+
+    assert sorted(calls) == [(1, 3.0), (2, 2.0)]
+    assert output.multimodal_outputs["ming_latent_patch"][:, 0, 0].tolist() == [1.0, 2.0, 3.0]
+    assert model._last_ming_next_token_ids == [3, 3, 3]
+
+
+def test_ming_forward_rejects_unsplittable_multi_request_batch(monkeypatch):
+    model, _ = _make_ming_batch_model(monkeypatch, spans=None)
+
+    with pytest.raises(RuntimeError, match="Cannot split 5 Ming Stage-0 tokens across 2 requests"):
+        MingLLMModel.forward(
+            model,
+            input_ids=torch.zeros(5, dtype=torch.long),
+            positions=torch.arange(5),
+            inputs_embeds=torch.zeros((5, 4)),
+            model_intermediate_buffer=[_ming_request("a", 1), _ming_request("b", 2)],
+        )
