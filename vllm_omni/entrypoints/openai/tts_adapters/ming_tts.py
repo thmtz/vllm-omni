@@ -12,6 +12,7 @@ from vllm.logger import init_logger
 from vllm_omni.entrypoints.openai.tts_adapters import register_tts_adapter
 from vllm_omni.entrypoints.openai.tts_adapters.base import ARTTSAdapter, PreparedRequest
 from vllm_omni.model_executor.models.ming_flash_omni.prompt_utils import DEFAULT_PROMPT as MING_DEFAULT_PROMPT
+from vllm_omni.model_executor.models.ming_flash_omni.text_processing import cut_text_by_semantic_length
 from vllm_omni.model_executor.models.ming_tts.constants import SPEAKER_EMBEDDING_DIM
 
 if TYPE_CHECKING:
@@ -173,6 +174,21 @@ class MingTTSAdapter(ARTTSAdapter):
         if isinstance(request.ref_audio, list):
             return self._validate_ming_tts_podcast_request(request)
         return self._validate_ming_tts_single_speaker_request(request)
+
+    def split_long_input(self, request: "OpenAICreateSpeechRequest") -> list[str] | None:
+        """Split long single-speaker text the way the Ming reference runtime does.
+
+        Unsplit long input makes Ming skip phrases and stop early. The reference
+        runtime synthesizes fragments of at most 50 semantic units (words or
+        CJK characters) and concatenates them. Podcast input is already one
+        turn per line, and style instructions describe the whole utterance, so
+        neither is split.
+        """
+        if isinstance(request.ref_audio, list) or request.instructions:
+            return None
+        fragments = [fragment.lstrip("，").strip() for fragment in cut_text_by_semantic_length(request.input.strip())]
+        fragments = [fragment for fragment in fragments if fragment]
+        return fragments if len(fragments) > 1 else None
 
     async def build(
         self, request: "OpenAICreateSpeechRequest", sampling_params_list: list, has_inline_ref_audio: bool

@@ -38,7 +38,7 @@ convention of never folding audio into an opaque text count.
 from __future__ import annotations
 
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 from vllm_omni.entrypoints.openai.protocol.audio import (
@@ -158,10 +158,15 @@ class SpeechOutputTokenCounter:
     stage has a non-zero ``num_tokens_out`` (code2wav reports 0), so we take the
     max across stages. Tracking the max is safe because the metrics appear on
     the terminal output (intermediate outputs carry empty metrics).
+
+    A request whose input was split into fragments runs one engine request per
+    fragment through the same stream, so the max is taken per engine request
+    id and summed across them.
     """
 
     output_tokens: int = 0
     stage0_finish_reason: str | None = None
+    _tokens_by_request: dict[str, int] = field(default_factory=dict, repr=False)
 
     def observe(self, res: Any) -> None:
         metrics = getattr(res, "metrics", None)
@@ -175,12 +180,14 @@ class SpeechOutputTokenCounter:
             reason = stage0.get("finish_reason")
             if reason is not None:
                 self.stage0_finish_reason = str(reason)
+        request_id = str(getattr(res, "request_id", "") or "")
         for stage in stage_metrics.values():
             if not isinstance(stage, dict):
                 continue
             n = stage.get("num_tokens_out")
-            if isinstance(n, int) and n > self.output_tokens:
-                self.output_tokens = n
+            if isinstance(n, int) and n > self._tokens_by_request.get(request_id, 0):
+                self._tokens_by_request[request_id] = n
+        self.output_tokens = sum(self._tokens_by_request.values())
 
     def total(self) -> int:
         """Generated codec/audio token count (max stage ``num_tokens_out``)."""

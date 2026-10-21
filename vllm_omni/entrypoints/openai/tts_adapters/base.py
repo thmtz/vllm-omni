@@ -363,6 +363,17 @@ class TTSModelAdapter(ABC):
         """
         return sampling_params_list
 
+    def split_long_input(self, request: "OpenAICreateSpeechRequest") -> list[str] | None:
+        """Split long input into fragments synthesized as separate requests.
+
+        Called after :meth:`validate`. Return two or more fragments to have the
+        orchestrator build and run one engine request per fragment and join
+        their audio in order, or ``None`` to synthesize ``request.input`` as one
+        request. Override for models whose output degrades on long input.
+        Default: no splitting.
+        """
+        return None
+
     def validate_generation(
         self,
         tts_params: Mapping[str, object],
