@@ -3689,7 +3689,7 @@ class TestStreamingResponse:
         finalized_tts_params = {"_qwen3_tts_effective_max_tokens": [192]}
         captured: dict = {}
 
-        async def prepare(_request, request_id=None, arrival_time=None):
+        async def prepare(_request, request_id=None, arrival_time=None, split_long_input=False):
             return request_id, object(), finalized_tts_params
 
         async def generate_chunks(
