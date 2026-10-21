@@ -74,6 +74,7 @@ from vllm_omni.entrypoints.openai.tts_adapters.omnivoice import OmniVoiceAdapter
 from vllm_omni.entrypoints.utils import coerce_param_message_types
 from vllm_omni.metrics.modality import observe_audio_first_packet, observe_audio_streaming_finalize
 from vllm_omni.outputs import OmniRequestOutput
+from vllm_omni.outputs.mm_outputs import MultimodalPayload
 from vllm_omni.utils.speaker_cache import get_speaker_cache
 
 logger = init_logger(__name__)
@@ -2173,6 +2174,31 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         key = "audio" if "audio" in mm else ("model_outputs" if "model_outputs" in mm else None)
         return mm, key
 
+    @staticmethod
+    def _replace_audio_output(res, key: str, value: Any) -> None:
+        """Point ``res`` at a copy of its audio payload with ``key`` set to ``value``.
+
+        Writes where ``_extract_audio_output`` reads from. The payload is copied,
+        not mutated, because the engine may still hold it.
+        """
+        completion = next((output for output in res.outputs or [] if getattr(output, "multimodal_output", None)), None)
+        if isinstance(res, OmniRequestOutput):
+            # Its multimodal_output property prefers completion outputs over its own field.
+            holder, attr = (completion, "multimodal_output") if completion is not None else (res, "_multimodal_output")
+        elif getattr(res, "multimodal_output", None):
+            holder, attr = res, "multimodal_output"
+        else:
+            holder, attr = completion, "multimodal_output"
+        mm = getattr(holder, attr)
+        if isinstance(mm, MultimodalPayload):
+            if key in mm.tensors or key not in mm.metadata:
+                replaced = MultimodalPayload(tensors={**mm.tensors, key: value}, metadata=dict(mm.metadata))
+            else:
+                replaced = MultimodalPayload(tensors=dict(mm.tensors), metadata={**mm.metadata, key: value})
+        else:
+            replaced = {**mm, key: value}
+        setattr(holder, attr, replaced)
+
     async def _prepare_speech_generation(
         self,
         request: OpenAICreateSpeechRequest,
@@ -2438,7 +2464,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                         if audio_key is not None and isinstance(audio_output[audio_key], list):
                             fragment_chunks = audio_output[audio_key]
                             if earlier_chunks:
-                                audio_output[audio_key] = earlier_chunks + fragment_chunks
+                                self._replace_audio_output(res, audio_key, earlier_chunks + fragment_chunks)
                         yield res
                 earlier_chunks = earlier_chunks + fragment_chunks
             return
@@ -2480,10 +2506,10 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             waveform = torch.as_tensor(self._final_audio_tensor(audio_output[audio_key]))
             if waveform.numel() > 0:
                 waveforms.append(waveform)
-            last_audio_output = (audio_output, audio_key)
+            last_audio_output = (res, audio_key)
 
-        audio_output, audio_key = cast(tuple[dict, str], last_audio_output)
-        audio_output[audio_key] = torch.cat(waveforms, dim=-1) if waveforms else torch.zeros(0)
+        last_res, audio_key = cast(tuple[Any, str], last_audio_output)
+        self._replace_audio_output(last_res, audio_key, torch.cat(waveforms, dim=-1) if waveforms else torch.zeros(0))
         for outputs in fragment_outputs:
             for res in outputs:
                 yield res

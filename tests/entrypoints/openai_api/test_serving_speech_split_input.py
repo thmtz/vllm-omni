@@ -15,6 +15,8 @@ from vllm_omni.entrypoints.openai.serving_speech import OmniOpenAIServingSpeech
 from vllm_omni.entrypoints.openai.speech_usage import SpeechOutputTokenCounter
 from vllm_omni.entrypoints.openai.tts_adapters.base import PreparedRequest
 from vllm_omni.model_executor.models.ming_flash_omni.text_processing import get_semantic_length
+from vllm_omni.outputs import OmniRequestOutput
+from vllm_omni.outputs.mm_outputs import MultimodalPayload
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -27,16 +29,21 @@ def _words(text: str) -> list[str]:
     return re.findall(r"[A-Za-z0-9]+", text)
 
 
-class _Output:
-    def __init__(self, request_id: str, audio, tokens_out: int | None = None):
-        self.request_id = request_id
-        self.outputs = []
-        self.multimodal_output = {"audio": audio, "sr": torch.tensor(SAMPLE_RATE)}
-        self.metrics = (
-            {"stage_metrics": {"0": {"num_tokens_out": tokens_out, "finish_reason": "stop"}}}
-            if tokens_out is not None
-            else {}
-        )
+def _Output(request_id: str, audio, tokens_out: int | None = None) -> OmniRequestOutput:
+    """A real engine-shaped output: the AR stage attaches a MultimodalPayload to the completion."""
+    payload = MultimodalPayload(
+        tensors={} if audio is None or isinstance(audio, list) else {"audio": audio},
+        metadata={"sr": torch.tensor(SAMPLE_RATE), **({"audio": audio} if isinstance(audio, list) else {})},
+    )
+    source = SimpleNamespace(outputs=[SimpleNamespace(index=0, multimodal_output=payload)], finished=True)
+    metrics = (
+        {"stage_metrics": {"0": {"num_tokens_out": tokens_out, "finish_reason": "stop"}}}
+        if tokens_out is not None
+        else {}
+    )
+    return OmniRequestOutput.from_stage_output(
+        source, request_id=request_id, stage_id=0, final_output_type="audio", metrics=metrics
+    )
 
 
 @pytest.fixture
@@ -171,9 +178,9 @@ class TestPrepareSpeechGenerationSplit:
             _, generator, _ = await ming_tts_server._prepare_speech_generation(
                 request, request_id="speech-1", split_long_input=True
             )
-            return [[chunk.numel() for chunk in res.multimodal_output["audio"]] async for res in generator]
+            return [[chunk.numel() for chunk in res.multimodal_output["audio"]] async for res in generator], chunks
 
-        seen = asyncio.run(run())
+        seen, _ = asyncio.run(run())
 
         assert seen == [[3], [3, 4], [3, 4, 5]]
         assert events == [
