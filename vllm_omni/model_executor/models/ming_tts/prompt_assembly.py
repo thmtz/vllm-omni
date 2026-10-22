@@ -136,6 +136,7 @@ def build_dense_prompt_token_ids(
     prompt_text: str | None = None,
     speaker_count: int = 0,
     prompt_patch_count: int = 0,
+    instruction_end: str = "<|endoftext|>",
 ) -> list[int]:
     speaker_prompt = []
     for idx in range(int(speaker_count)):
@@ -146,7 +147,7 @@ def build_dense_prompt_token_ids(
             + tokenizer.encode("<|vision_end|>\n")
         )
     instruction_prompt = (
-        tokenizer.encode(instruction) + tokenizer.encode("<|endoftext|>") if instruction is not None else []
+        tokenizer.encode(instruction) + tokenizer.encode(instruction_end) if instruction is not None else []
     )
     prompt_text_tokens = (
         tokenizer.encode(prompt_text) if int(prompt_patch_count) > 0 and prompt_text is not None else []
@@ -234,6 +235,9 @@ def build_prompt_token_ids(model_variant: str, tokenizer: Any, **kwargs: Any) ->
     """Dispatch to the dense or MoE Stage-0 prompt builder by model variant."""
     if model_variant == "moe":
         return build_moe_prompt_token_ids(tokenizer, **kwargs)
+    if model_variant == "ming3_dense":
+        # Ming-3.0-tts-0.5B closes the assistant caption with <|im_end|>.
+        return build_dense_prompt_token_ids(tokenizer, instruction_end="<|im_end|>", **kwargs)
     return build_dense_prompt_token_ids(tokenizer, **kwargs)
 
 

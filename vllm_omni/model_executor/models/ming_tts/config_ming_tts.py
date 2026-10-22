@@ -47,6 +47,8 @@ from .constants import (
     LLM_HIDDEN_SIZE,
     LLM_VOCAB_SIZE,
     MAX_DECODE_STEPS,
+    MING3_DENSE_MAX_DECODE_STEPS,
+    MING3_DENSE_PATCH_SIZE,
     MOE_AUDIO_DUMMY_TOKEN_ID,
     MOE_AUDIO_END_TOKEN_ID,
     MOE_AUDIO_EOS_TOKEN_ID,
@@ -254,6 +256,11 @@ class MingTTSConfig:
     audio_eos_token_id: int = AUDIO_EOS_TOKEN_ID
     speaker_placeholder_token_id: int = VISION_START_TOKEN_ID  # dense <|vision_start|>; moe <spk>
 
+    @property
+    def is_ming3_dense(self) -> bool:
+        """Ming-3.0-tts-0.5B: the dense backbone with a one-latent-per-step DiT."""
+        return self.model_variant == "dense" and self.patch_size == MING3_DENSE_PATCH_SIZE
+
     @classmethod
     def from_hf_config(cls, hf_config: PretrainedConfig) -> MingTTSConfig:
         llm_raw = getattr(hf_config, "llm_config", {}) or {}
@@ -292,6 +299,8 @@ class MingTTSConfig:
             sample_rate=atc_sample_rate,
             audio_frame_hop=enc_hop_size if enc_hop_size is not None else AUDIO_FRAME_HOP,
         )
+        if cfg.is_ming3_dense:
+            cfg.max_decode_steps = MING3_DENSE_MAX_DECODE_STEPS
         if model_variant == "moe":
             # The bailing tokenizer uses a different vocab; override the dense
             # (Qwen2) special-token defaults with the bailing token IDs.

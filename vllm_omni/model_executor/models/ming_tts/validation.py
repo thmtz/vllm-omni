@@ -14,6 +14,7 @@ from .constants import (
     LATENT_DIM,
     LLM_HIDDEN_SIZE,
     LLM_VOCAB_SIZE,
+    MING3_DENSE_PATCH_SIZE,
     MOE_AUDIO_DUMMY_TOKEN_ID,
     MOE_AUDIO_EOS_TOKEN_ID,
     MOE_TEXT_EOS_TOKEN_ID,
@@ -100,13 +101,14 @@ def validate_ming_tts_config(cfg: Any) -> None:
             f"latent_dim mismatch: got {cfg.latent_dim}, expected {LATENT_DIM}. "
             "Check audio_tokenizer_config.enc_kwargs.latent_dim."
         )
-    if cfg.patch_size != PATCH_SIZE:
+    if cfg.patch_size not in (PATCH_SIZE, MING3_DENSE_PATCH_SIZE):
         raise ValueError(
             f"patch_size mismatch: got {cfg.patch_size}, expected {PATCH_SIZE}. Check ditar_config.patch_size."
         )
-    if cfg.history_patch_size != HISTORY_PATCH_SIZE:
+    expected_history = MING3_DENSE_PATCH_SIZE if cfg.patch_size == MING3_DENSE_PATCH_SIZE else HISTORY_PATCH_SIZE
+    if cfg.history_patch_size != expected_history:
         raise ValueError(
-            f"history_patch_size mismatch: got {cfg.history_patch_size}, expected {HISTORY_PATCH_SIZE}. "
+            f"history_patch_size mismatch: got {cfg.history_patch_size}, expected {expected_history}. "
             "Check ditar_config.history_patch_size."
         )
     # Absolute hidden/vocab pins are dense-only; the MoE backbone carries its
@@ -122,8 +124,11 @@ def validate_ming_tts_config(cfg: Any) -> None:
     if cfg.sample_rate != SAMPLE_RATE:
         raise ValueError(f"sample_rate mismatch: got {cfg.sample_rate}, expected {SAMPLE_RATE}.")
 
-    if cfg.vae_patch_size != cfg.patch_size:
-        raise ValueError(f"VAE patch size ({cfg.vae_patch_size}) != flow/DiT patch size ({cfg.patch_size}).")
+    # Ming-3.0 dense decodes several flow patches per VAE patch.
+    if cfg.vae_patch_size % cfg.patch_size:
+        raise ValueError(
+            f"VAE patch size ({cfg.vae_patch_size}) is not a multiple of flow/DiT patch size ({cfg.patch_size})."
+        )
 
     llm_hidden_from_cfg = cfg.llm_config.get("hidden_size")
     if llm_hidden_from_cfg is not None and llm_hidden_from_cfg != cfg.llm_hidden_size:

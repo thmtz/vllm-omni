@@ -62,6 +62,11 @@ LATENT_CHUNK_SIZE = 25
 INITIAL_LATENT_CHUNK_SIZE = 4
 LATENT_LEFT_CONTEXT = 0
 MAX_DECODE_STEPS = 200
+# Ming-3.0-tts-0.5B keeps the dense backbone but emits one 80 ms latent per
+# decode step (DiT patch_size 1), so 200 steps would stop at 16 s of audio.
+# 512 matches the pipeline's Stage-0 max_tokens constraint (about 41 s).
+MING3_DENSE_PATCH_SIZE = 1
+MING3_DENSE_MAX_DECODE_STEPS = 512
 
 
 # ---------------------------------------------------------------------------

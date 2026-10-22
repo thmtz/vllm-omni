@@ -65,6 +65,15 @@ class MingTTSAdapter(ARTTSAdapter):
             raise ValueError(f"Ming reference audio sample rates must be positive, got {sample_rates}")
         return waveforms, sample_rates
 
+    def _is_ming3_dense(self) -> bool:
+        """Ming-3.0-tts-0.5B: the dense backbone with a DiT patch size of 1."""
+        from vllm_omni.model_executor.models.ming_tts.constants import MING3_DENSE_PATCH_SIZE
+
+        hf_config = self.ctx.engine_client.model_config.hf_config
+        ditar = getattr(hf_config, "ditar_config", None) or {}
+        patch_size = ditar.get("patch_size") if isinstance(ditar, dict) else getattr(ditar, "patch_size", None)
+        return patch_size == MING3_DENSE_PATCH_SIZE
+
     def _parse_ming_instruction(self, request: "OpenAICreateSpeechRequest") -> Any:
         """Build a Ming instruction payload from OpenAI speech fields."""
         return parse_ming_instruction_fields(
@@ -120,12 +129,19 @@ class MingTTSAdapter(ARTTSAdapter):
         if request.max_new_tokens is not None:
             runtime_controls[KEY_MAX_DECODE_STEPS] = request.max_new_tokens
 
+        is_ming3_dense = self._is_ming3_dense()
+        prompt = MING_DEFAULT_PROMPT
+        if is_ming3_dense and request.language:
+            # Ming-3.0's prompt contract names the target language after the task prompt.
+            prompt += f"Target language: {request.language}.\n"
+
         prompt_dict = build_ming_dense_prompt(
             self.ctx.server._tts_tokenizer,
             # bgm / music-prompt mode not supported online;
             # requires prompt_mode API extension (deferred).
-            prompt=MING_DEFAULT_PROMPT,
+            prompt=prompt,
             text=request.input,
+            model_variant="ming3_dense" if is_ming3_dense else None,
             runtime_controls=runtime_controls or None,
             instruction=self._parse_ming_instruction(request),
             prompt_text=ref_text,
