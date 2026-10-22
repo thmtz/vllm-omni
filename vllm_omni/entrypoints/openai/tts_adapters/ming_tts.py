@@ -43,8 +43,8 @@ def parse_ming_instruction_fields(server, request, *, include_voice=False, plain
 
 @register_tts_adapter
 class MingTTSAdapter(ARTTSAdapter):
-    #: OpenAI clients play ``pcm`` as 24 kHz. Ming generates 44.1 kHz.
-    supported_output_sample_rates = frozenset({24000})
+    #: Ming generates 44.1 kHz. OpenAI clients play ``pcm`` as 24 kHz.
+    supported_output_sample_rates = frozenset({24000, 44100})
 
     def _coerce_ming_prompt_waveform(self, wav_samples, sample_rate):
         from torchaudio.functional import resample as resample_audio
@@ -71,12 +71,13 @@ class MingTTSAdapter(ARTTSAdapter):
 
     def _is_ming3_dense(self) -> bool:
         """Ming-3.0-tts-0.5B: the dense backbone with a DiT patch size of 1."""
-        from vllm_omni.model_executor.models.ming_tts.constants import MING3_DENSE_PATCH_SIZE
+        cached = getattr(self, "_ming3_dense", None)
+        if cached is None:
+            from vllm_omni.model_executor.models.ming_tts.config_ming_tts import MingTTSConfig
 
-        hf_config = self.ctx.engine_client.model_config.hf_config
-        ditar = getattr(hf_config, "ditar_config", None) or {}
-        patch_size = ditar.get("patch_size") if isinstance(ditar, dict) else getattr(ditar, "patch_size", None)
-        return patch_size == MING3_DENSE_PATCH_SIZE
+            hf_config = self.ctx.engine_client.model_config.hf_config
+            cached = self._ming3_dense = MingTTSConfig.from_hf_config(hf_config).is_ming3_dense
+        return cached
 
     def _parse_ming_instruction(self, request: "OpenAICreateSpeechRequest") -> Any:
         """Build a Ming instruction payload from OpenAI speech fields."""
@@ -190,6 +191,11 @@ class MingTTSAdapter(ARTTSAdapter):
         if not request.input or not request.input.strip():
             return "Input text cannot be empty"
 
+        if self._is_ming3_dense() and (
+            request.ref_audio is not None or request.speaker_embedding is not None or request.ref_text is not None
+        ):
+            # Cloning on Ming-3.0-tts-0.5B is not validated: its prompt contract differs from Ming-omni-tts.
+            return "Voice cloning is not supported for Ming-3.0-tts-0.5B on this server; use a preset voice"
         if isinstance(request.ref_audio, list):
             return self._validate_ming_tts_podcast_request(request)
         return self._validate_ming_tts_single_speaker_request(request)

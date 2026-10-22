@@ -28,6 +28,7 @@ from .config_ming_tts import (
     SAMPLE_RATE,
     VAE_PATCH_SIZE,
 )
+from .constants import MING3_DENSE_PATCH_SIZE
 
 DEFAULT_PROMPT = "Please generate speech based on the following description.\n"
 BASE_CAPTION_TEMPLATE: dict[str, Any] = {
@@ -101,8 +102,10 @@ def estimate_decode_steps_for_duration(
     return max(1, int(math.ceil(required_samples / float(samples_per_decode_step))))
 
 
-def estimate_decode_step_window_for_duration(duration_seconds: float) -> tuple[int, int]:
-    target_steps = estimate_decode_steps_for_duration(duration_seconds)
+def estimate_decode_step_window_for_duration(
+    duration_seconds: float, *, patch_size: int = PATCH_SIZE
+) -> tuple[int, int]:
+    target_steps = estimate_decode_steps_for_duration(duration_seconds, patch_size=patch_size)
     min_steps = max(1, target_steps - 3)
     max_steps = max(min_steps, target_steps + 3)
     return min_steps, max_steps
@@ -112,6 +115,7 @@ def resolve_effective_runtime_controls(
     *,
     text: str,
     runtime_controls: dict[str, Any] | None = None,
+    patch_size: int = PATCH_SIZE,
 ) -> dict[str, Any]:
     controls = {} if runtime_controls is None else dict(runtime_controls)
     has_explicit_min = KEY_MIN_DECODE_STEPS in controls and controls[KEY_MIN_DECODE_STEPS] is not None
@@ -121,7 +125,9 @@ def resolve_effective_runtime_controls(
     duration_seconds = parse_duration_seconds(text)
     if duration_seconds is None:
         return controls
-    min_decode_steps, max_decode_steps = estimate_decode_step_window_for_duration(duration_seconds)
+    min_decode_steps, max_decode_steps = estimate_decode_step_window_for_duration(
+        duration_seconds, patch_size=patch_size
+    )
     controls[KEY_MIN_DECODE_STEPS] = min_decode_steps
     controls[KEY_MAX_DECODE_STEPS] = max_decode_steps
     return controls
@@ -289,13 +295,17 @@ def build_ming_dense_prompt(
                 f"speaker_count={effective_speaker_count} does not match "
                 f"{len(speaker_embeddings)} provided speaker embeddings"
             )
-    effective_runtime_controls = resolve_effective_runtime_controls(text=text, runtime_controls=runtime_controls)
+    # Ming-3.0 dense emits one latent per decode step, Ming-omni-tts four.
+    patch_size = MING3_DENSE_PATCH_SIZE if model_variant == "ming3_dense" else PATCH_SIZE
+    effective_runtime_controls = resolve_effective_runtime_controls(
+        text=text, runtime_controls=runtime_controls, patch_size=patch_size
+    )
 
     prompt_waveform_tensor = None
     prompt_patch_count = 0
     if prompt_waveform is not None:
         prompt_waveform_tensor = pad_prompt_waveform(prompt_waveform)
-        prompt_patch_count = count_prompt_waveform_patches(prompt_waveform_tensor)
+        prompt_patch_count = count_prompt_waveform_patches(prompt_waveform_tensor, patch_size=patch_size)
     if prompt_waveform_tensor is not None and prompt_latents is not None:
         raise ValueError(
             "Ming waveform cloning request provided both raw prompt_waveform and explicit prompt_latents. "
@@ -311,7 +321,7 @@ def build_ming_dense_prompt(
     if prompt_latents is not None:
         prompt_latent_value = torch.as_tensor(prompt_latents)
         prompt_patch_count = count_prompt_latent_patches(
-            prompt_latent_value, patch_size=PATCH_SIZE, latent_dim=LATENT_DIM
+            prompt_latent_value, patch_size=patch_size, latent_dim=LATENT_DIM
         )
 
     prompt_token_ids = build_prompt_token_ids(
