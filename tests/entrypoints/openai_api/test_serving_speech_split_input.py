@@ -9,9 +9,10 @@ from types import SimpleNamespace
 import pytest
 import torch
 from pytest_mock import MockerFixture
+from vllm import SamplingParams
 
 from vllm_omni.entrypoints.openai.protocol.audio import OpenAICreateSpeechRequest
-from vllm_omni.entrypoints.openai.serving_speech import OmniOpenAIServingSpeech
+from vllm_omni.entrypoints.openai.serving_speech import OmniOpenAIServingSpeech, _max_parallel_fragments
 from vllm_omni.entrypoints.openai.speech_usage import SpeechOutputTokenCounter
 from vllm_omni.entrypoints.openai.tts_adapters.base import PreparedRequest
 from vllm_omni.model_executor.models.ming_flash_omni.text_processing import get_semantic_length
@@ -113,9 +114,9 @@ class TestMingSplitLongInput:
         assert all(get_semantic_length(fragment) <= 50 for fragment in fragments)
         assert _words(" ".join(fragments)) == _words(LONG_TEXT)
 
-    def test_ming_offers_24khz_output(self, ming_tts_server):
-        assert 24000 in type(ming_tts_server._adapter).supported_output_sample_rates
-        request = OpenAICreateSpeechRequest(input="Hi.", voice="lingguang", sample_rate=24000)
+    @pytest.mark.parametrize("rate", [24000, 44100])
+    def test_ming_offers_24khz_and_native_output(self, ming_tts_server, rate):
+        request = OpenAICreateSpeechRequest(input="Hi.", voice="lingguang", sample_rate=rate)
         assert ming_tts_server._validate_speech_sample_rate(request) is None
 
     def test_style_instructions_and_podcast_are_not_split(self, ming_tts_server):
@@ -161,8 +162,8 @@ class TestPrepareSpeechGenerationSplit:
         # Non-streaming fragments run concurrently: all start before any ends.
         assert [kind for kind, _ in events[: len(fragments)]] == ["start"] * len(fragments)
 
-    def test_non_streaming_fragment_cap_bounds_concurrency(self, ming_tts_server, monkeypatch):
-        monkeypatch.setenv("VLLM_OMNI_TTS_MAX_PARALLEL_FRAGMENTS", "2")
+    def test_non_streaming_fragment_cap_bounds_concurrency(self, ming_tts_server):
+        ming_tts_server._max_parallel_fragments = 2
         running = 0
         peak = 0
 
@@ -185,13 +186,65 @@ class TestPrepareSpeechGenerationSplit:
         assert peak == 2
         assert len(audio_bytes) == 2 * sum(_fragment_samples({"prompt": fragment}) for fragment in fragments)
 
-    def test_fragment_cap_rejects_a_negative_value(self, ming_tts_server, monkeypatch):
-        monkeypatch.setenv("VLLM_OMNI_TTS_MAX_PARALLEL_FRAGMENTS", "-1")
-        ming_tts_server.engine_client.generate.side_effect = _final_only_generate([])
-        request = OpenAICreateSpeechRequest(input=LONG_TEXT, voice="lingguang", response_format="pcm")
-
+    @pytest.mark.parametrize("value", ["-1", "two"])
+    def test_fragment_cap_rejects_a_bad_value(self, monkeypatch, value):
+        monkeypatch.setenv("VLLM_OMNI_TTS_MAX_PARALLEL_FRAGMENTS", value)
         with pytest.raises(ValueError, match="VLLM_OMNI_TTS_MAX_PARALLEL_FRAGMENTS"):
+            _max_parallel_fragments()
+
+    def test_empty_middle_fragment_fails_the_non_streaming_request(self, ming_tts_server, mocker):
+        mocker.patch.object(ming_tts_server._adapter, "split_long_input", return_value=["One.", "Two.", "Three."])
+
+        async def generate(*, prompt, request_id, **kwargs):
+            samples = 0 if request_id.endswith("part1") else 10
+            yield _Output(request_id, torch.ones(1, samples), tokens_out=1)
+
+        ming_tts_server.engine_client.generate.side_effect = generate
+        request = OpenAICreateSpeechRequest(input="One. Two. Three.", voice="lingguang", response_format="pcm")
+
+        with pytest.raises(ValueError, match="part1 produced empty audio"):
             asyncio.run(ming_tts_server._generate_audio_bytes(request, request_id="speech-1"))
+
+    def test_empty_middle_fragment_stops_the_stream(self, ming_tts_server, mocker):
+        mocker.patch.object(ming_tts_server._adapter, "split_long_input", return_value=["One.", "Two.", "Three."])
+        started: list[str] = []
+
+        async def generate(*, prompt, request_id, **kwargs):
+            started.append(request_id)
+            yield _Output(request_id, [] if request_id.endswith("part1") else [torch.ones(3)])
+
+        ming_tts_server.engine_client.generate.side_effect = generate
+        request = OpenAICreateSpeechRequest(input="One. Two. Three.", voice="lingguang", stream=True)
+
+        async def run():
+            _, generator, _ = await ming_tts_server._prepare_speech_generation(
+                request, request_id="speech-1", split_long_input=True
+            )
+            return [res async for res in generator]
+
+        with pytest.raises(ValueError, match="part1 produced no audio"):
+            asyncio.run(run())
+        assert started == ["speech-1-part0", "speech-1-part1"]
+
+    def test_fragments_of_a_seeded_request_get_distinct_seeds(self, ming_tts_server, mocker):
+        mocker.patch.object(ming_tts_server._adapter, "split_long_input", return_value=["One.", "Two."])
+        ming_tts_server.engine_client.generate.return_value = "generator"
+        request = OpenAICreateSpeechRequest(input="One. Two.", voice="lingguang", seed=7, stream=True)
+        seeds: list[int] = []
+
+        def capture(engine_requests, **kwargs):
+            seeds.extend(params[0].seed for _, _, params in engine_requests)
+            return "split-generator"
+
+        mocker.patch.object(ming_tts_server, "_generate_split_input", side_effect=capture)
+        ming_tts_server.engine_client.default_sampling_params_list = [
+            SamplingParams(max_tokens=2048),
+            SamplingParams(max_tokens=1),
+        ]
+
+        asyncio.run(ming_tts_server._prepare_speech_generation(request, request_id="speech-1", split_long_input=True))
+
+        assert seeds == [7, 8]
 
     def test_streaming_runs_fragments_in_order_with_one_growing_chunk_list(self, ming_tts_server, mocker):
         mocker.patch.object(

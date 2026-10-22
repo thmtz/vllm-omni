@@ -655,6 +655,8 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         # before adapter construction so adapters can create their make_async
         # wrappers during their own lifecycle initialization.
         self._tts_executor = ThreadPoolExecutor(max_workers=1)
+        # Read once so a bad value fails at startup, not on a customer's long request.
+        self._max_parallel_fragments = _max_parallel_fragments()
         # Resolve the per-model serving adapter (RFC #4327), keyed on the
         # detected model-type. Every dedicated TTS model has an adapter; the
         # adapter owns request validation, prompt/param building, capability
@@ -2361,7 +2363,10 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             output_modalities.append(TIMESTAMPS_MODALITY)
 
         def segment_sampling_params(
-            segment_request: OpenAICreateSpeechRequest, segment_prompt: Any, segment_request_id: str
+            segment_request: OpenAICreateSpeechRequest,
+            segment_prompt: Any,
+            segment_request_id: str,
+            segment_index: int = 0,
         ) -> list:
             params = sampling_params_list
             # Apply adapter-owned sampling overrides, including request-level token
@@ -2374,10 +2379,12 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
 
                 params = copy.deepcopy(params)
                 stage0_params = params[0]
-                stage0_params.seed = request.seed
+                # Offset per fragment so fragments of one request draw independent noise.
+                seed = request.seed + segment_index
+                stage0_params.seed = seed
                 if stage0_params.extra_args is None:
                     stage0_params.extra_args = {}
-                stage0_params.extra_args["tts_local_seed"] = request.seed
+                stage0_params.extra_args["tts_local_seed"] = seed
 
             if getattr(request, "word_timestamps", False) and is_streaming_request:
                 # The aligner consumes the terminal waveform, so retain earlier
@@ -2404,7 +2411,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                     (
                         segment_request_id,
                         segment_prompt,
-                        segment_sampling_params(segment_request, segment_prompt, segment_request_id),
+                        segment_sampling_params(segment_request, segment_prompt, segment_request_id, index),
                     )
                 )
             self._log_request("TTS speech request %s: split into %d fragments", request_id, len(segments))
@@ -2478,20 +2485,29 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             earlier_chunks: list[Any] = []
             for engine_request in engine_requests:
                 fragment_chunks: list[Any] = []
+                fragment_has_audio = False
                 async with aclosing(generate(engine_request)) as outputs:
                     async for res in outputs:
                         audio_output, audio_key = self._extract_audio_output(res)
-                        if audio_key is not None and isinstance(audio_output[audio_key], list):
-                            fragment_chunks = audio_output[audio_key]
-                            if earlier_chunks:
-                                self._replace_audio_output(res, audio_key, earlier_chunks + fragment_chunks)
+                        if audio_key is not None:
+                            audio = audio_output[audio_key]
+                            fragment_has_audio = fragment_has_audio or bool(
+                                audio if isinstance(audio, list) else torch.as_tensor(audio).numel()
+                            )
+                            if isinstance(audio, list):
+                                fragment_chunks = audio
+                                if earlier_chunks:
+                                    self._replace_audio_output(res, audio_key, earlier_chunks + fragment_chunks)
                         yield res
+                if not fragment_has_audio:
+                    # Stop before the next fragment rather than stream audio with a sentence missing.
+                    raise ValueError(f"Fragment request {engine_request[0]} produced no audio.")
                 earlier_chunks = earlier_chunks + fragment_chunks
             return
 
         # Each fragment is its own engine sequence, so an unbounded split request
         # can take most of the batch from the streams sharing the box.
-        limit = _max_parallel_fragments()
+        limit = self._max_parallel_fragments
         slots = asyncio.Semaphore(limit) if limit else None
 
         async def collect_outputs(engine_request: tuple[str, Any, list]) -> list[Any]:
@@ -2532,8 +2548,10 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                     )
                 sample_rate = fragment_sample_rate
             waveform = torch.as_tensor(self._final_audio_tensor(audio_output[audio_key]))
-            if waveform.numel() > 0:
-                waveforms.append(waveform)
+            if waveform.numel() == 0:
+                # A dropped fragment would return speech with a sentence missing.
+                raise ValueError(f"Fragment request {fragment_request_id} produced empty audio.")
+            waveforms.append(waveform)
             last_audio_output = (res, audio_key)
 
         last_res, audio_key = cast(tuple[Any, str], last_audio_output)
