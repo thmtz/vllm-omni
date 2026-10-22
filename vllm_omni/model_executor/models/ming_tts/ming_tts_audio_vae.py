@@ -41,6 +41,12 @@ class MingAudioVAEModel(nn.Module):
         self.ming_config.validate()
 
         self.audio = AudioVAE(self.ming_config.audio_tokenizer_config, build_encoder=False)
+        # Decode each chunk in one call. With frame_holdback the upsampler keeps
+        # back only the chunk's last latent as lookahead, so a whole-chunk call
+        # emits the same samples, as early, as one call per latent.
+        upsampling = getattr(self.audio.decoder, "upsampling", None)
+        if upsampling is not None:
+            upsampling.frame_holdback = True
         self.have_multimodal_outputs = True
         self.has_preprocess = False
         self.has_postprocess = False
@@ -80,27 +86,15 @@ class MingAudioVAEModel(nn.Module):
             waveform_flat = torch.zeros((0,), dtype=torch.float32, device=latent_chunk.device)
             return waveform_flat, stream_state, past_key_values, had_past_key_values, had_stream_state
 
-        # The decoder streams (upsampler state, sliding-window KV cache, ISTFT
-        # overlap buffers), so a chunk can go through in one call instead of one
-        # call per patch. The upsampler holds back its whole latest input as
-        # lookahead, though, so the last patch goes in its own call: that keeps
-        # the held-back audio to one patch, as with per-patch decoding.
-        if finished or patch_count == 1:
-            pieces = [latent_chunk]
-        else:
-            pieces = [latent_chunk[:-1], latent_chunk[-1:]]
-        waveform_parts: list[torch.Tensor] = []
-        for piece_idx, piece in enumerate(pieces):
-            # [patches, patch_size, latent_dim] -> [Batch=1, Time, latent_dim]
-            waveform, stream_state, past_key_values = self.audio.decode(
-                piece.reshape(1, -1, piece.shape[-1]),
-                past_key_values=past_key_values,
-                use_cache=True,
-                stream_state=stream_state,
-                last_chunk=finished and piece_idx == len(pieces) - 1,
-            )
-            waveform_parts.append(waveform.reshape(-1).to(torch.float32))
-        waveform_flat = torch.cat(waveform_parts, dim=0)
+        # [patches, patch_size, latent_dim] -> [Batch=1, Time, latent_dim]
+        waveform, stream_state, past_key_values = self.audio.decode(
+            latent_chunk.reshape(1, -1, latent_chunk.shape[-1]),
+            past_key_values=past_key_values,
+            use_cache=True,
+            stream_state=stream_state,
+            last_chunk=finished,
+        )
+        waveform_flat = waveform.reshape(-1).to(torch.float32)
         return waveform_flat, stream_state, past_key_values, had_past_key_values, had_stream_state
 
     @torch.inference_mode()
