@@ -124,12 +124,6 @@ def validate_ming_tts_config(cfg: Any) -> None:
     if cfg.sample_rate != SAMPLE_RATE:
         raise ValueError(f"sample_rate mismatch: got {cfg.sample_rate}, expected {SAMPLE_RATE}.")
 
-    # Ming-3.0 dense decodes several flow patches per VAE patch.
-    if cfg.vae_patch_size % cfg.patch_size:
-        raise ValueError(
-            f"VAE patch size ({cfg.vae_patch_size}) is not a multiple of flow/DiT patch size ({cfg.patch_size})."
-        )
-
     llm_hidden_from_cfg = cfg.llm_config.get("hidden_size")
     if llm_hidden_from_cfg is not None and llm_hidden_from_cfg != cfg.llm_hidden_size:
         raise ValueError(f"llm_hidden_size ({cfg.llm_hidden_size}) != llm_config.hidden_size ({llm_hidden_from_cfg}).")

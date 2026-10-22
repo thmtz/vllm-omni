@@ -20,6 +20,30 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
+# Ming-3.0-tts-0.5B's language IDs (its reference runtime's table): short codes
+# and names resolve to the name its prompt expects.
+MING3_DENSE_LANGUAGE_NAMES = {
+    "zh": "Chinese",
+    "zh-cn": "Chinese",
+    "chinese": "Chinese",
+    "en": "English",
+    "english": "English",
+    "ja": "Japanese",
+    "japanese": "Japanese",
+    "ko": "Korean",
+    "korean": "Korean",
+    "de": "German",
+    "german": "German",
+    "fr": "French",
+    "french": "French",
+    "es": "Spanish",
+    "spanish": "Spanish",
+    # Cantonese is a Chinese dialect, not a separate target language.
+    "yue": "Chinese",
+    "zh-yue": "Chinese",
+    "cantonese": "Chinese",
+}
+
 
 def parse_ming_instruction_fields(server, request, *, include_voice=False, plain_text_passthrough=False):
     instruction_text = request.instructions.strip() if isinstance(request.instructions, str) else None
@@ -136,9 +160,10 @@ class MingTTSAdapter(ARTTSAdapter):
 
         is_ming3_dense = self._is_ming3_dense()
         prompt = MING_DEFAULT_PROMPT
-        if is_ming3_dense and request.language:
+        if is_ming3_dense and request.language and request.language.strip():
             # Ming-3.0's prompt contract names the target language after the task prompt.
-            prompt += f"Target language: {request.language}.\n"
+            language = request.language.strip()
+            prompt += f"Target language: {MING3_DENSE_LANGUAGE_NAMES.get(language.lower(), language)}.\n"
 
         prompt_dict = build_ming_dense_prompt(
             self.ctx.server._tts_tokenizer,

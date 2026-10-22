@@ -246,6 +246,28 @@ class TestPrepareSpeechGenerationSplit:
 
         assert seeds == [7, 8]
 
+    def test_non_streaming_joins_fragments_in_text_order_when_they_finish_out_of_order(self, ming_tts_server, mocker):
+        mocker.patch.object(ming_tts_server._adapter, "split_long_input", return_value=["One.", "Two.", "Three."])
+
+        async def generate(*, prompt, request_id, **kwargs):
+            index = int(request_id.rsplit("part", 1)[1])
+            await asyncio.sleep(0.03 * (2 - index))  # the last fragment finishes first
+            yield _Output(request_id, torch.full((1, 4), float(index + 1)), tokens_out=1)
+
+        ming_tts_server.engine_client.generate.side_effect = generate
+        request = OpenAICreateSpeechRequest(input="One. Two. Three.", voice="lingguang")
+
+        async def run():
+            _, generator, _ = await ming_tts_server._prepare_speech_generation(
+                request, request_id="speech-1", split_long_input=True
+            )
+            outputs = [res async for res in generator]
+            audio_output, audio_key = ming_tts_server._extract_audio_output(outputs[-1])
+            return ming_tts_server._final_audio_tensor(audio_output[audio_key])
+
+        joined = torch.as_tensor(asyncio.run(run())).reshape(-1)
+        assert joined.tolist() == [1.0] * 4 + [2.0] * 4 + [3.0] * 4
+
     def test_streaming_runs_fragments_in_order_with_one_growing_chunk_list(self, ming_tts_server, mocker):
         mocker.patch.object(
             ming_tts_server._adapter,
