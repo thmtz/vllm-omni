@@ -43,6 +43,9 @@ def parse_ming_instruction_fields(server, request, *, include_voice=False, plain
 
 @register_tts_adapter
 class MingTTSAdapter(ARTTSAdapter):
+    #: OpenAI clients play ``pcm`` as 24 kHz. Ming generates 44.1 kHz.
+    supported_output_sample_rates = frozenset({24000})
+
     def _coerce_ming_prompt_waveform(self, wav_samples, sample_rate):
         from torchaudio.functional import resample as resample_audio
 
