@@ -88,6 +88,10 @@ class MingLLMModel(nn.Module):
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
         self.ming_config = MingTTSConfig.from_hf_config(vllm_config.model_config.hf_config)
+        if self.ming_config.is_ming3_dense:
+            # Batch the flow head across requests, as for Ming-3.0-tts-tiny. Each
+            # request keeps its own RNG, so batched audio matches serial audio.
+            self.vectorize_cfm_decode = True
         self.ming_config.validate()
         self.vllm_config = vllm_config
         self.prefix = prefix
