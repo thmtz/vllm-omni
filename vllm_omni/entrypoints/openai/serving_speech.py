@@ -85,6 +85,23 @@ _SPEECH_USAGE_OUTPUT_TOKENS_HEADER = "X-VLLM-OMNI-OUTPUT-TOKENS"
 _SPEECH_USAGE_TOTAL_TOKENS_HEADER = "X-VLLM-OMNI-TOTAL-TOKENS"
 _SPEECH_USAGE_INPUT_TEXT_TOKENS_HEADER = "X-VLLM-OMNI-INPUT-TEXT-TOKENS"
 _SPEECH_USAGE_INPUT_AUDIO_TOKENS_HEADER = "X-VLLM-OMNI-INPUT-AUDIO-TOKENS"
+
+
+_MAX_PARALLEL_FRAGMENTS_ENV = "VLLM_OMNI_TTS_MAX_PARALLEL_FRAGMENTS"
+
+
+def _max_parallel_fragments() -> int:
+    """How many fragments of one non-streaming split request run at once (0 = all)."""
+    raw = os.environ.get(_MAX_PARALLEL_FRAGMENTS_ENV, "0")
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise ValueError(f"{_MAX_PARALLEL_FRAGMENTS_ENV} must be an integer, got {raw!r}") from exc
+    if value < 0:
+        raise ValueError(f"{_MAX_PARALLEL_FRAGMENTS_ENV} must be >= 0, got {value}")
+    return value
+
+
 # Raw ``pcm`` bodies carry no format header and the rate/channel count is
 # model-native, so responses state the s16le layout explicitly.
 SPEECH_AUDIO_SAMPLE_RATE_HEADER = "X-Audio-Sample-Rate"
@@ -2472,8 +2489,16 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 earlier_chunks = earlier_chunks + fragment_chunks
             return
 
+        # Each fragment is its own engine sequence, so an unbounded split request
+        # can take most of the batch from the streams sharing the box.
+        limit = _max_parallel_fragments()
+        slots = asyncio.Semaphore(limit) if limit else None
+
         async def collect_outputs(engine_request: tuple[str, Any, list]) -> list[Any]:
-            async with aclosing(generate(engine_request)) as outputs:
+            if slots is None:
+                async with aclosing(generate(engine_request)) as outputs:
+                    return [res async for res in outputs]
+            async with slots, aclosing(generate(engine_request)) as outputs:
                 return [res async for res in outputs]
 
         tasks = [asyncio.ensure_future(collect_outputs(engine_request)) for engine_request in engine_requests]
